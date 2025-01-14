@@ -45,9 +45,12 @@ func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	totalItems := 0
-	totalCategoriesMap := make(map[string]bool)
-	totalPrice := 0.0
+	defer func() {
+		// Если где-то возникла ошибка, откатываем
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
 
 	for _, zipFile := range zipReader.File {
 		fileReader, err := zipFile.Open()
@@ -60,7 +63,7 @@ func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 
 		csvReader := csv.NewReader(fileReader)
 
-		_, err = csvReader.Read()
+		_, err = csvReader.Read() // читаем хедер
 		if err != nil {
 			log.Printf("Error reading header row: %v\n", err)
 			http.Error(w, "Failed to read header row", http.StatusInternalServerError)
@@ -78,7 +81,6 @@ func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// row format: [id, name, category, price, create_date]
 			id, err := strconv.Atoi(row[0])
 			if err != nil {
 				log.Printf("Error converting ID (%s): %v\n", row[0], err)
@@ -96,22 +98,22 @@ func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			createDate := row[4] // If needed, parse as time.Time
-
-			_, err = tx.Exec(`
-                INSERT INTO prices (id, name, category, price, create_date)
-                VALUES ($1, $2, $3, $4, $5)
-            `, id, itemName, category, price, createDate)
+			createDate, err := time.Parse(time.RFC3339, row[4])
 			if err != nil {
-				log.Printf("Error inserting data into prices table: %v\n", err)
-				tx.Rollback()
-				http.Error(w, "Failed to insert data", http.StatusInternalServerError)
+				log.Printf("Error parsing date (%s): %v\n", row[4], err)
+				http.Error(w, "Invalid date format", http.StatusBadRequest)
 				return
 			}
 
-			totalItems++
-			totalCategoriesMap[category] = true
-			totalPrice += price
+			_, err = tx.Exec(`
+				INSERT INTO prices (id, name, category, price, create_date)
+				VALUES ($1, $2, $3, $4, $5)
+			`, id, itemName, category, price, createDate)
+			if err != nil {
+				log.Printf("Error inserting data into prices table: %v\n", err)
+				http.Error(w, "Failed to insert data", http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 
@@ -121,20 +123,10 @@ func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	totalCategories := len(totalCategoriesMap)
-	response := ResponseData{
-		TotalItems:      totalItems,
-		TotalCategories: totalCategories,
-		TotalPrice:      totalPrice,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("Error encoding JSON response: %v\n", err)
-		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
-		return
-	}
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Successfully inserted!"))
 }
+
 
 func GetPricesHandler(w http.ResponseWriter, r *http.Request) {
 	db := storage.GetDB()
@@ -146,18 +138,15 @@ func GetPricesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	// Буфер в памяти, куда запишем CSV
-	var csvBuffer bytes.Buffer
-	csvWriter := csv.NewWriter(&csvBuffer)
-
-	// Заполняем CSV
+	// 1. Считываем все строки из базы в слайс
+	var records [][]string
 	for rows.Next() {
 		var (
 			id         int
 			name       string
 			category   string
 			price      float64
-			createDate string // либо time.Time, если нужно парсить
+			createDate time.Time
 		)
 
 		if err := rows.Scan(&id, &name, &category, &price, &createDate); err != nil {
@@ -166,40 +155,52 @@ func GetPricesHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Преобразуем price во float -> string
 		priceStr := strconv.FormatFloat(price, 'f', 2, 64)
+		createDateStr := createDate.Format(time.RFC3339)
 
 		record := []string{
 			strconv.Itoa(id),
 			name,
 			category,
 			priceStr,
-			createDate,
+			createDateStr,
 		}
-		if err := csvWriter.Write(record); err != nil {
-			log.Printf("Failed to write record to CSV: %v", err)
-			http.Error(w, "Failed to write CSV", http.StatusInternalServerError)
-			return
-		}
+		records = append(records, record)
 	}
-	csvWriter.Flush() // сбрасываем буфер в csvBuffer
 
-	// Если в rows была ошибка после Next()
+	// 2. Проверяем, не возникли ли ошибки при чтении rows
 	if err := rows.Err(); err != nil {
 		log.Printf("Error during rows iteration: %v", err)
 		http.Error(w, "Failed to iterate rows", http.StatusInternalServerError)
 		return
 	}
 
-	// Готовим заголовки ответа
+	// 3. Во втором цикле записываем данные в CSV
+	var csvBuffer bytes.Buffer
+	csvWriter := csv.NewWriter(&csvBuffer)
+
+	for _, rec := range records {
+		if err := csvWriter.Write(rec); err != nil {
+			log.Printf("Failed to write record to CSV: %v", err)
+			http.Error(w, "Failed to write CSV", http.StatusInternalServerError)
+			return
+		}
+	}
+	csvWriter.Flush()
+
+	if err := csvWriter.Error(); err != nil {
+		log.Printf("Error flushing CSV writer: %v", err)
+		http.Error(w, "Failed to write CSV", http.StatusInternalServerError)
+		return
+	}
+
+	// 4. Подготовка ответа в виде ZIP-архива
 	w.Header().Set("Content-Disposition", "attachment; filename=response.zip")
 	w.Header().Set("Content-Type", "application/zip")
 
-	// Создаём zip в потоке ответа
 	zipWriter := zip.NewWriter(w)
 	defer zipWriter.Close()
 
-	// Добавляем файл data.csv внутрь архива
 	fileWriter, err := zipWriter.Create("data.csv")
 	if err != nil {
 		log.Printf("Failed to create file in zip: %v", err)
@@ -207,7 +208,6 @@ func GetPricesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Пишем CSV-данные в data.csv внутри архива
 	if _, err := io.Copy(fileWriter, &csvBuffer); err != nil {
 		log.Printf("Failed to copy data to zip: %v", err)
 		http.Error(w, "Failed to copy data to zip", http.StatusInternalServerError)

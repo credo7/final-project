@@ -24,9 +24,10 @@ func InitDB() error {
 
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS prices (
 		id SERIAL PRIMARY KEY,
-		category TEXT,
-		item_name TEXT,
-		price REAL
+		name VARCHAR(255) NOT NULL,
+        category VARCHAR(255) NOT NULL,
+        price DECIMAL(10, 2) NOT NULL,
+		create_date TIMESTAMP WITH TIME ZONE NOT NULL
 	)`)
 	if err != nil {
 		return err
