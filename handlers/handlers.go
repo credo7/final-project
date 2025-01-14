@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"project_sem/storage"
 )
@@ -22,7 +23,7 @@ type ResponseData struct {
 func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("Entering PostPricesHandler")
 
-	file, _, err := r.FormFile("file")
+	file, fileHeader, err := r.FormFile("file")
 	if err != nil {
 		log.Printf("Error reading file from form: %v\n", err)
 		http.Error(w, "Failed to read file", http.StatusBadRequest)
@@ -30,29 +31,37 @@ func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
+	log.Printf("Successfully received file: %s\n", fileHeader.Filename)
+
 	zipReader, err := zip.NewReader(file, r.ContentLength)
 	if err != nil {
 		log.Printf("Error reading ZIP archive: %v\n", err)
 		http.Error(w, "Failed to read zip archive", http.StatusInternalServerError)
 		return
 	}
+	log.Println("ZIP archive opened successfully")
 
 	db := storage.GetDB()
+	log.Println("Successfully connected to the database")
+
 	tx, err := db.Begin()
 	if err != nil {
 		log.Printf("Error beginning transaction: %v\n", err)
 		http.Error(w, "Failed to begin transaction", http.StatusInternalServerError)
 		return
 	}
+	log.Println("Transaction started")
 
+	// In case of error, rollback
 	defer func() {
-		// Если где-то возникла ошибка, откатываем
 		if err != nil {
+			log.Println("Rolling back transaction due to an error")
 			tx.Rollback()
 		}
 	}()
 
 	for _, zipFile := range zipReader.File {
+		log.Printf("Processing file inside ZIP: %s\n", zipFile.Name)
 		fileReader, err := zipFile.Open()
 		if err != nil {
 			log.Printf("Error reading file in ZIP: %v\n", err)
@@ -62,17 +71,20 @@ func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 		defer fileReader.Close()
 
 		csvReader := csv.NewReader(fileReader)
+		log.Println("Created CSV reader")
 
-		_, err = csvReader.Read() // читаем хедер
+		headerRow, err := csvReader.Read() // читаем хедер
 		if err != nil {
 			log.Printf("Error reading header row: %v\n", err)
 			http.Error(w, "Failed to read header row", http.StatusInternalServerError)
 			return
 		}
+		log.Printf("Header row read successfully: %v\n", headerRow)
 
 		for {
 			row, err := csvReader.Read()
 			if err == io.EOF {
+				log.Println("Reached end of CSV file")
 				break
 			}
 			if err != nil {
@@ -81,12 +93,15 @@ func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			log.Printf("Read CSV row: %v\n", row)
+
 			id, err := strconv.Atoi(row[0])
 			if err != nil {
 				log.Printf("Error converting ID (%s): %v\n", row[0], err)
 				http.Error(w, "Invalid ID value", http.StatusBadRequest)
 				return
 			}
+			log.Printf("Parsed ID: %d\n", id)
 
 			itemName := row[1]
 			category := row[2]
@@ -97,13 +112,15 @@ func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Invalid price value", http.StatusBadRequest)
 				return
 			}
+			log.Printf("Parsed price: %.2f\n", price)
 
-			createDate, err := time.Parse(time.RFC3339, row[4])
+			createDate, err := time.Parse("2006-01-02", row[4])
 			if err != nil {
 				log.Printf("Error parsing date (%s): %v\n", row[4], err)
 				http.Error(w, "Invalid date format", http.StatusBadRequest)
 				return
 			}
+			log.Printf("Parsed date: %v\n", createDate)
 
 			_, err = tx.Exec(`
 				INSERT INTO prices (id, name, category, price, create_date)
@@ -114,7 +131,26 @@ func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Failed to insert data", http.StatusInternalServerError)
 				return
 			}
+			log.Println("Inserted row into prices table successfully")
 		}
+	}
+
+	var totalItems int
+	var totalCategories int
+	var totalPrice float64
+
+	err = tx.QueryRow(`
+		SELECT 
+			COUNT(*) AS total_items,
+			COUNT(DISTINCT category) AS total_categories,
+			COALESCE(SUM(price), 0) AS total_price
+		FROM prices
+	`).Scan(&totalItems, &totalCategories, &totalPrice)
+	if err != nil {
+		log.Printf("Error reading stats from database: %v\n", err)
+		tx.Rollback()
+		http.Error(w, "Failed to get statistics", http.StatusInternalServerError)
+		return
 	}
 
 	if err = tx.Commit(); err != nil {
@@ -123,10 +159,19 @@ func PostPricesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Successfully inserted!"))
-}
+	response := ResponseData{
+		TotalItems:      totalItems,
+		TotalCategories: totalCategories,
+		TotalPrice:      totalPrice,
+	}
 
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Error encoding JSON response: %v\n", err)
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
+}
 
 func GetPricesHandler(w http.ResponseWriter, r *http.Request) {
 	db := storage.GetDB()
